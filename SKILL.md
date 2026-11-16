@@ -1,534 +1,139 @@
 ---
 name: NVivo-transcript
-description: Converts Zoom transcripts into NVivo-compatible Word document format with timestamps, speakers, and naturalized content. Use when user says "NVivo transcript", "convert transcript for NVivo", "prepare transcript for NVivo", "transform Zoom transcript", "naturalise", or mentions importing transcripts into NVivo for qualitative analysis.
+description: Turns anonymised Zoom transcripts (the *_anon.vtt files from anonymise-transcripts) into NVivo-ready Word tables (Timestamp | Speaker | Content) with naturalised text, plus corpus .txt for AntConc/LancsBox and an identifiable twin with identical timestamps. Step 3 of the anonymise-first pipeline. Use when the user says "NVivo transcript", "convert transcript for NVivo", "prepare transcript for NVivo", "transform Zoom transcript", "naturalise", or mentions importing interview transcripts into NVivo.
 ---
 
-# NVivo Transcript Converter
+# NVivo transcript (v2)
 
-Transform Zoom transcripts into naturalized, flowing conversation while maintaining strict timestamp accuracy and sequential ordering. Output as an MS Word document with a 3-column table suitable for direct import into NVivo.
+Step 3 of a three-step pipeline that takes Zoom interview transcripts to NVivo **without an AI ever reading identifiable text**. It starts from the anonymised `.vtt` that step 2 (`anonymise-transcripts`) writes. Claude naturalises the text; a script checks Claude's work and writes the Word transcript, so every timestamp comes from the transcript itself and cannot drift.
 
-## Input Format
+## Rules that do not bend
 
-The source Zoom transcript follows this structure:
+1. **Anonymised input only.** Work on `*_anon.vtt` files from step 2. If the user gives a raw Zoom `.vtt` (no `_anon` in the name, real names in the speaker labels), stop: say that the pipeline anonymises first and point to the `anonymise-transcripts` skill. Do not read the raw file to check.
+2. **Never read identifiable files.** Not the raw `.vtt`, not anything in `_anonymisation/`, not the `identifiable/` twins that `twin` writes. `twin` prints counts only; do not inspect its output.
+3. **Keep the anonymisation intact.** Every bracketed marker (`[Researcher 1]`, `[independent secondary school A]`, `[phone number redacted]`) stays exactly as it is, and pseudonyms stay as they are. Never "correct" a word into a proper noun that was not spoken: a misheard word that might be a name is left alone or marked `[UNCLEAR]`. The script refuses rows that drop a marker and warns on new capitalised words.
+4. **Complete and in order.** Every cue is covered, nothing is summarised, no word order is changed.
+
+## The pipeline end to end
 
 ```
-Item_Number
-Timestamp_Beginning --> Timestamp_End
-Speaker: Content
+raw/*.vtt  (Zoom transcripts: IDENTIFIABLE)
+   |
+   |  STEP 1  anon_table.py scan  -> _anonymisation/Anonymisation_Review.xlsx
+   |          researcher fills it in (Excel, by hand)
+   |          anon_table.py build -> _anonymisation/Anonymisation_Table.xlsx        NO AI
+   |
+   |  STEP 2  anonymise_vtt.py   -> anonymised/*_anon.vtt (same cues, same times)
+   |                               _anonymisation/audit/*_audit.md, manifest.json   Claude runs the script,
+   |  STEP 2b Claude reads anonymised/*_anon.vtt + _review/candidates.md             reads anonymised text only
+   |          -> suggested rows -> researcher approves -> anon_table.py add -> re-run step 2
+   |
+   |  STEP 3  nvivo_build.py prepare -> Claude naturalises chunk by chunk -> rows-NN.json     (THIS SKILL)
+   |          nvivo_build.py build   -> nvivo/*_anon_NVivo.docx (Timestamp | Speaker | Content)
+   |                                    nvivo/txt/*_anon.txt (corpus text, researchers stripped)
+   |          nvivo_build.py twin    -> identifiable/*_NVivo.docx (same rows, same times, real text)
+   v
+downstream: qdpx-augment builds the anonymised project from nvivo/ and the identifiable one from identifiable/;
+qdpx-auto-code codes the anonymised project and `transfer`s codings by timestamp; qdpx-media-sync plays the
+recordings against the identifiable site; AntConc / LancsBox read nvivo/txt/.
 ```
 
-## Output Format
+| Component | Where | Who runs it | Reads | Writes |
+|---|---|---|---|---|
+| `anon_table.py` (step 1) | `anonymise-transcripts/scripts/` | researcher, or Claude (prints counts only) | raw `.vtt`, table | review workbook, table |
+| `anonymise_vtt.py` (step 2) | `anonymise-transcripts/scripts/` | Claude | raw `.vtt`, table | `anonymised/*_anon.vtt`, audit logs, manifest |
+| review (step 2b) | `anonymise-transcripts` SKILL.md | Claude | anonymised text only | suggested table rows |
+| `nvivo_build.py` (step 3) | `nvivo-transcript/scripts/` | Claude | `*_anon.vtt`, Claude's rows; `twin` also raw `.vtt` via the manifest | NVivo `.docx`, corpus `.txt`, identifiable twins |
 
-### File Structure
-- MS Word document (.docx)
-- Filename: Original transcript filename with "_NVivo" suffix
-- Single table with header row
+How the parts connect:
 
-### Table Structure
-| Timestamp | Speaker | Content |
-|-----------|---------|---------|
-| 00:00:00.000 | Speaker A | This is the beginning of the conversation... |
-| 00:00:15.340 | Speaker B | I agree with that point... |
+- **Cues are the backbone.** Step 2 keeps every Zoom cue, one for one, with its time. Step 3 numbers the cues; Claude's rows say only which cue each row starts at. The script takes the time from that cue, so timestamps are exact by construction.
+- **The twin replays the same rows over the raw text.** `build` saves the row structure (`_nvivo_work/<name>/rows.final.json`: cue ranges and times, no text). `twin` finds the raw file through step 2's `manifest.json` and writes the identifiable transcript with the same rows and times and the raw words (mechanically cleaned, not naturalised). The anonymised and identifiable projects built from `nvivo/` and `identifiable/` therefore match turn for turn, which is what `qdpx-auto-code transfer` and `qdpx-media-sync` need.
+- **A gap in anonymisation is fixed upstream.** If you notice a name while naturalising, do not fix it in the rows: report it, have it added to the table (step 2b), re-run step 2, and run `prepare` again.
 
-### Table Requirements
-- First row: Header row with column names (Timestamp, Speaker, Content)
-- One row per turn-take or natural paragraph break
-- Three columns per row
+Folder layout: `raw/` and `_anonymisation/` and `identifiable/` are IDENTIFIABLE; `anonymised/`, `_nvivo_work/` and `nvivo/` are anonymised. See the `anonymise-transcripts` skill for the full layout and steps 1 and 2.
 
-## Critical Requirements
+Needs Python 3.8+ with `python-docx` (`pip install python-docx`). On Windows type `python` where this file says `python3`. Run with `-B` so no `__pycache__` is left in the user's folders.
 
-### 1. Timestamp Rules (Absolute Priority)
+## Steps
 
-**Sequential and Unique:**
-- EVERY timestamp MUST be strictly sequential and ascending (each timestamp > previous timestamp)
-- EVERY timestamp MUST be unique - no timestamp can appear more than once
-- Timestamps must progress forward in time throughout the entire document
-- The progression forward in time must be by at least 0.1 seconds
-- If a progression from the previous timestamp is less than 0.1 seconds, make a small adjustment (less than 1.0 seconds)
+### 1. Prepare
 
-**Timestamp Field Construction:**
-- Extract the Timestamp_Beginning from the original transcript
-- Reproduce it EXACTLY as it appears (everything before ` --> Timestamp_End`)
-- Do not modify the timestamp format or values, with the only exception being a micro adjustment (less than 1.0 seconds) to ensure minimum 0.1 second progression
-- Preserve all digits, colons, and decimal points exactly
-
-**Synchronization:**
-- The text in each row must synchronize accurately with its timestamp
-- Minor adjustments allowed: You may move a few words to the previous timestamp row if it completes a sentence or idea
-- If a sentence/idea cuts across two timestamps, place ALL words of that idea in the FIRST timestamp row
-- This is the ONLY acceptable deviation from strict timestamp/text alignment
-
-### 2. Speaker Field Rules
-
-**Reproduction:**
-- Copy the speaker name EXACTLY as it appears in the original transcript
-- Preserve capitalization, spacing, and spelling
-- No modifications unless specifically detailed below
-
-**Consistency:**
-- If a speaker's name appears in different formats (e.g., "John Smith" vs "John"), standardize to the most complete version
-- Maintain consistency throughout the document
-
-### 3. Content Transformation Rules
-
-**YOU MUST DO:**
-- Combine fragmented speech from the same speaker into natural, flowing paragraphs
-- Correct obvious punctuation errors
-- Fix stuttering by removing doubled words (e.g., "the the" → "the")
-- Fix misspelled/misheard words when context makes the correction obvious (e.g., "definately compleated" → "definitely completed")
-- Preserve the original word order exactly as spoken
-- Complete the ENTIRE transcript - do not output in small portions requiring prompts for more
-
-**YOU MUST NOT DO:**
-- Change the order of words spoken
-- Skip, omit, or summarize any part of the transcript
-- Add words that weren't spoken
-
-**Handling Unclear/Indecipherable Words:**
-
-Use [SQUARE BRACKETS WITH CAPITALS] ONLY when:
-- Words are truly indecipherable or nonsensical
-- Acronyms that cannot be identified from context
-- Abbreviations whose meaning is unclear
-- Garbled audio where you cannot determine what was said
-
-**Decision Tree for Word Handling:**
-1. Is the word's intended meaning clear from context?
-   - YES → Correct the spelling/grammar
-   - NO → Is it an acronym, abbreviation, or truly indecipherable?
-     - YES → Mark with [CAPS IN BRACKETS]
-     - NO → Leave as-is and flag for review
-
-### 4. Paragraph Breaking Strategy
-
-When the same speaker has an extended turn:
-- Break into natural paragraphs of approximately 100-150 words
-- Place breaks at natural pause points (topic shifts, completed thoughts)
-- Each new paragraph becomes a new table row
-- Use the timestamp from where that paragraph's content actually begins in the original transcript
-- Ensure timestamps remain sequential
-
-**Combining Fragments:**
-- You MAY combine sequential text from sequential timestamps under a single timestamp if it improves sentence structure, grammar, and punctuation
-- Priority: Natural flow while maintaining timestamp accuracy
-
-## Step-by-Step Process
-
-### Step 1: Parse Input Data
-Extract all transcript entries with structure:
-- Item_Number
-- Timestamp_Beginning (before ` --> `)
-- Timestamp_End (after ` --> `)
-- Speaker (before `:`)
-- Content (after `:`)
-
-### Step 2: Build Speaker Turns
-- Group consecutive entries by speaker
-- Track the timestamp_begin for each fragment
-- Preserve the exact timestamp/content relationship
-
-### Step 3: Naturalize Content
-For each speaker turn:
-- Combine fragments into flowing text
-- Fix punctuation and grammar
-- Remove stuttering
-- Correct obvious misspellings using context
-- Mark truly unclear words with [CAPITALS IN BRACKETS]
-- If turn exceeds ~150 words, break into paragraphs
-- Each paragraph gets timestamp from its actual starting point
-
-### Step 4: Handle Cross-Timestamp Sentences
-If a sentence/idea spans multiple timestamps:
-- Place COMPLETE sentence in the FIRST timestamp row
-- Adjust subsequent content accordingly
-- Ensure no orphaned sentence fragments
-
-### Step 5: Verify Sequential Order
-CRITICAL VALIDATION:
-1. All entries must be sorted by timestamp (ascending)
-2. Verify: timestamp[i] > timestamp[i-1] for all i
-3. Verify: no duplicate timestamps
-4. If violations exist, adjust timestamps minimally to maintain sequence
-
-### Step 6: Output Word Document
-- Create Word document with filename: `[original_name]_NVivo.docx`
-- Insert table with header row: Timestamp | Speaker | Content
-- Add data rows with appropriate formatting
-
-## Validation Checklist
-
-Before providing final output, verify:
-- [ ] All timestamps are strictly ascending (each > previous)
-- [ ] No timestamp appears more than once
-- [ ] Table has three columns: Timestamp | Speaker | Content
-- [ ] Complete transcript (no content omitted)
-- [ ] Unclear words marked with [CAPITALS IN BRACKETS] only when truly indecipherable
-- [ ] Obvious misspellings corrected using context
-- [ ] Natural paragraph flow while preserving original words
-- [ ] Timestamp/text synchronization maintained (with only minor adjustments for sentence completion)
-
-## Examples
-
-### Example 1: Correct Timestamp Handling
-
-**Input:**
-```
-1
-00:00:00.000 --> 00:00:05.000
-John: This is the beginning
-
-2
-00:00:05.500 --> 00:00:10.000
-John: of my thought about
-
-3
-00:00:10.500 --> 00:00:15.000
-John: the project timeline.
+```bash
+python3 -B <skill>/scripts/nvivo_build.py prepare anonymised --work _nvivo_work
 ```
 
-**Output Table:**
-| Timestamp | Speaker | Content |
-|-----------|---------|---------|
-| 00:00:00.000 | John | This is the beginning of my thought about the project timeline. |
+For each `*_anon.vtt` it writes `_nvivo_work/<name>/chunk-01.md`, `chunk-02.md`... (about 2,000 words each, split at a change of speaker). Each line is one cue: `[12] 00:01:02.340 Hannah: text`.
 
-### Example 2: Cross-Timestamp Sentence
+### 2. Naturalise, chunk by chunk
 
-**Input:**
-```
-1
-00:00:00.000 --> 00:00:03.000
-Mary: We need to consider the budget implications
+Read one chunk in full and write `rows-NN.json` beside it (same number):
 
-2
-00:00:03.500 --> 00:00:07.000
-Mary: before making any decisions.
-
-3
-00:00:07.500 --> 00:00:10.000
-Mary: Let me explain why.
+```json
+[
+  {"cue": 1, "content": "Hi Hannah, thanks for joining. I'm [Researcher 1] and this is Dr. [Researcher 2]. Can you tell us about your work at [independent secondary school A]?"},
+  {"cue": 3, "content": "Sure. So I've been at [independent secondary school A] for six years; I started in [early 2020]."}
+]
 ```
 
-**Output Table:**
-| Timestamp | Speaker | Content |
-|-----------|---------|---------|
-| 00:00:00.000 | Mary | We need to consider the budget implications before making any decisions. |
-| 00:00:07.500 | Mary | Let me explain why. |
+- A row **starts at a cue** and runs to the cue before the next row. The first row of a chunk starts at the chunk's first cue. A row never crosses a change of speaker. The speaker and time come from the start cue; do not write them.
+- **One row per speaker turn**, or per natural paragraph in a long turn: break long turns at about 100-150 words, at a topic shift or completed thought, starting the new row at the cue where that paragraph begins.
+- **A sentence that runs across cues goes whole into the row where it starts.** That is the only time words move between cues.
 
-### Example 3a: Clear from Context (Correct the Error)
+What naturalising means:
 
-**Input:**
-```
-1
-00:00:15.000 --> 00:00:20.000
-Tom: The report was definately compleated last week
-```
+- **Do:** join fragments into flowing sentences; correct punctuation; remove stutters and doubled words ("the the" -> "the"); correct a misheard or misspelled word when context makes the intended word obvious ("definately compleated" -> "definitely completed"), unless the correction would be a name.
+- **Do not:** change word order; skip, omit or summarise anything; add words that were not spoken; touch bracketed markers or pseudonyms.
+- **Unclear words:** mark with `[UNCLEAR]` or a capitalised bracket only when a word is truly indecipherable, an acronym or abbreviation that cannot be identified, or garbled. Decision: is the meaning clear from context? Yes: correct it. No: is it an acronym, abbreviation or garble? Yes: bracket it. No: leave it as it is and mention it in your report.
 
-**Output Table:**
-| Timestamp | Speaker | Content |
-|-----------|---------|---------|
-| 00:00:15.000 | Tom | The report was definitely completed last week. |
+Finish every chunk; do not stop to ask whether to continue. For many or long transcripts, give each transcript (or each chunk) to a subagent with this section as its brief, so the main context stays clear.
 
-### Example 3b: Truly Unclear (Use Brackets)
+### 3. Check, then build
 
-**Input:**
-```
-1
-00:00:15.000 --> 00:00:20.000
-Tom: We implemented the new [garbled audio] system in March
+```bash
+python3 -B <skill>/scripts/nvivo_build.py build anonymised --work _nvivo_work --out nvivo --check
 ```
 
-**Output Table:**
-| Timestamp | Speaker | Content |
-|-----------|---------|---------|
-| 00:00:15.000 | Tom | We implemented the new [UNCLEAR] system in March. |
+**Errors** (nothing is written until they are fixed): a missing or out-of-order cue, a row across a change of speaker, an empty row, a dropped bracketed marker, a time that cannot be made unique. **Warnings** to read and judge: a row missing more than a quarter of its spoken words (omission?) or with more than a quarter new words (addition?), a new capitalised word not in the transcript (an introduced name?), and a time nudged forward (under a second) to stay 0.1 s after the previous row. Fix the rows and check again; then run without `--check`:
 
-### Example 4: Speaker Change
-
-**Input:**
-```
-5
-00:00:30.000 --> 00:00:35.000
-Alice: I agree with that assessment completely.
-
-6
-00:00:36.000 --> 00:00:40.000
-Bob: However, we should also consider alternative approaches.
+```bash
+python3 -B <skill>/scripts/nvivo_build.py build anonymised --work _nvivo_work --out nvivo
 ```
 
-**Output Table:**
-| Timestamp | Speaker | Content |
-|-----------|---------|---------|
-| 00:00:30.000 | Alice | I agree with that assessment completely. |
-| 00:00:36.000 | Bob | However, we should also consider alternative approaches. |
+It writes `nvivo/<name>_NVivo.docx` (header row Timestamp | Speaker | Content, one table, author fields cleared) and `nvivo/txt/<name>.txt`: the corpus text, with the researchers' turns left out (`[Researcher N]`, Interviewer, Moderator, Facilitator; add others with `--strip "A; B"`, or keep all with `--keep-all`), timestamps dropped, one paragraph per row, Unicode normalised (straight quotes, ligatures split, zero-width characters removed, accents kept), UTF-8, LF. If no rows were stripped it says so: the researchers may have other labels.
 
-### Example 5: Long Speaker Turn with Paragraph Breaks
+**No AI at all:** `build --mechanical` skips naturalising and uses Zoom's own turns, split near 150 words, with doubled words removed. Useful for a quick first look, or where the project does not allow even anonymised text to go to an AI.
 
-**Input:**
-```
-10
-00:02:00.000 --> 00:02:10.000
-Dr. Smith: The research findings indicate several important trends that we need to discuss.
+### 4. Identifiable twin (when the project needs one)
 
-11
-00:02:10.500 --> 00:02:20.000
-Dr. Smith: First, the data shows a significant correlation between variables A and B.
+Needed for `qdpx-media-sync` (recordings played against the transcript) and for `qdpx-auto-code transfer` (coding carried to the identifiable project).
 
-12
-00:02:20.500 --> 00:02:30.000
-Dr. Smith: Second, we observed unexpected patterns in the control group.
-
-13
-00:02:30.500 --> 00:02:40.000
-Dr. Smith: These findings suggest we should revise our initial hypothesis.
+```bash
+python3 -B <skill>/scripts/nvivo_build.py twin --manifest _anonymisation/audit/manifest.json --out identifiable --work _nvivo_work
 ```
 
-**Output Table:**
-| Timestamp | Speaker | Content |
-|-----------|---------|---------|
-| 00:02:00.000 | Dr. Smith | The research findings indicate several important trends that we need to discuss. First, the data shows a significant correlation between variables A and B. Second, we observed unexpected patterns in the control group. |
-| 00:02:30.500 | Dr. Smith | These findings suggest we should revise our initial hypothesis. |
+It prints only counts: twins written, and any skipped (not yet built in step 3, raw file moved, cue counts or times differing). Twin files are named after the raw transcript (`<raw name>_NVivo.docx`) so `qdpx-media-sync` can match them to recordings by name. Never open them.
 
-## Common Errors to Avoid
+### 5. Report
 
-**WRONG: Duplicate timestamps**
-| Timestamp | Speaker | Content |
-|-----------|---------|---------|
-| 00:05:00.000 | Speaker A | First paragraph |
-| 00:05:00.000 | Speaker A | Second paragraph |
+Files written, rows per file, any warnings you accepted and why, words you left or marked unclear, and anything that looked like a missed identifier (to go back to step 2b). Remind the user that `identifiable/` is identifiable data.
 
-**CORRECT: Unique, sequential timestamps**
-| Timestamp | Speaker | Content |
-|-----------|---------|---------|
-| 00:05:00.000 | Speaker A | First paragraph |
-| 00:05:12.450 | Speaker A | Second paragraph |
+## Validation checklist
 
-**WRONG: Non-sequential timestamps**
-| Timestamp | Speaker | Content |
-|-----------|---------|---------|
-| 00:05:00.000 | Speaker A | Content |
-| 00:07:30.000 | Speaker B | Content |
-| 00:06:15.000 | Speaker A | Content (Goes backward!) |
+- [ ] Input was `*_anon.vtt` from step 2.
+- [ ] Every chunk naturalised completely; no summarising, no reordering.
+- [ ] `build --check` passed with no errors; every warning looked at.
+- [ ] `nvivo/*_NVivo.docx` and `nvivo/txt/*.txt` written; stripped-row counts plausible.
+- [ ] Twin built if the project needs one; its output not opened.
+- [ ] Possible missed identifiers reported for step 2b, not fixed in the rows.
 
-**CORRECT: Always ascending**
-| Timestamp | Speaker | Content |
-|-----------|---------|---------|
-| 00:05:00.000 | Speaker A | Content |
-| 00:06:15.000 | Speaker A | Content |
-| 00:07:30.000 | Speaker B | Content |
+## Changelog
 
-**WRONG: Breaking sentences across rows unnecessarily**
-| Timestamp | Speaker | Content |
-|-----------|---------|---------|
-| 00:05:00.000 | Speaker A | We need to consider |
-| 00:05:03.000 | Speaker A | the budget carefully. |
+### v2.0.0 (November 2026)
+- Works on anonymised `.vtt` from `anonymise-transcripts` v2 (anonymise first, then naturalise), so the AI never reads identifiable text.
+- New `scripts/nvivo_build.py` (`prepare`, `build`, `twin`): Claude writes rows by cue number; the script takes times from the cues, checks completeness, speakers, markers, omissions and additions, and writes the `.docx` and corpus `.txt`. `--mechanical` builds without AI.
+- `twin` writes an identifiable transcript with identical rows and times from the raw `.vtt`, for `qdpx-media-sync` and `qdpx-auto-code transfer`.
+- The corpus `.txt` (researchers stripped) moves here from the anonymiser's old Mode B.
 
-**CORRECT: Complete thought in first timestamp**
-| Timestamp | Speaker | Content |
-|-----------|---------|---------|
-| 00:05:00.000 | Speaker A | We need to consider the budget carefully. |
-
-**WRONG: Not correcting obvious misspellings**
-| Timestamp | Speaker | Content |
-|-----------|---------|---------|
-| 00:05:00.000 | Speaker A | The report was definately compleated. |
-
-**CORRECT: Fix obvious errors from context**
-| Timestamp | Speaker | Content |
-|-----------|---------|---------|
-| 00:05:00.000 | Speaker A | The report was definitely completed. |
-
-## Token Management
-
-- Process as much of the transcript as your token window allows
-- Do NOT stop and ask for permission to continue
-- If you reach token limits, output what you've processed and indicate where you stopped
-- User will prompt for continuation if needed
-
-## Technical Implementation
-
-### Required Python Dependencies
-```
-python-docx
-```
-
-### Correct Imports (use ONLY these)
-```python
-import re
-from docx import Document
-from docx.shared import Inches, Pt
-```
-
-**DO NOT import:**
-- `Wd_Table_Alignment` (does not exist in python-docx)
-- `Wd_Align_Paragraph` (not needed for this task)
-
-### Reference Implementation
-
-Use this tested Python script as the basis for conversion:
-
-```python
-import re
-from docx import Document
-from docx.shared import Inches, Pt
-
-def parse_vtt(file_path):
-    """Parse VTT file and extract entries."""
-    with open(file_path, 'r', encoding='utf-8') as f:
-        content = f.read()
-
-    blocks = content.strip().split('\n\n')
-    entries = []
-
-    for block in blocks:
-        lines = block.strip().split('\n')
-        if len(lines) >= 2:
-            for i, line in enumerate(lines):
-                if '-->' in line:
-                    timestamp_match = re.match(r'(\d{2}:\d{2}:\d{2}\.\d{3})\s*-->', line)
-                    if timestamp_match:
-                        timestamp = timestamp_match.group(1)
-                        if i + 1 < len(lines):
-                            content_line = lines[i + 1]
-                            speaker_match = re.match(r'^([^:]+):\s*(.*)$', content_line)
-                            if speaker_match:
-                                speaker = speaker_match.group(1).strip()
-                                text = speaker_match.group(2).strip()
-                                entries.append({
-                                    'timestamp': timestamp,
-                                    'speaker': speaker,
-                                    'content': text
-                                })
-                    break
-    return entries
-
-def naturalize_content(text):
-    """Fix stuttering, punctuation, and obvious errors."""
-    # Remove repeated words (stuttering)
-    text = re.sub(r'\b(\w+)\s+\1\b', r'\1', text, flags=re.IGNORECASE)
-
-    # Ensure proper sentence ending
-    text = text.strip()
-    if text and text[-1] not in '.!?':
-        if len(text) > 10:
-            text += '.'
-    return text
-
-def combine_speaker_turns(entries, max_words=150):
-    """Combine consecutive entries from the same speaker."""
-    if not entries:
-        return []
-
-    combined = []
-    current = None
-
-    for entry in entries:
-        speaker = entry['speaker']
-
-        if current is None:
-            current = {
-                'timestamp': entry['timestamp'],
-                'speaker': speaker,
-                'content': entry['content'],
-                'word_count': len(entry['content'].split())
-            }
-        elif speaker == current['speaker']:
-            current['content'] += ' ' + entry['content']
-            current['word_count'] = len(current['content'].split())
-
-            if current['word_count'] > max_words:
-                combined.append(current)
-                current = {
-                    'timestamp': entry['timestamp'],
-                    'speaker': speaker,
-                    'content': '',
-                    'word_count': 0
-                }
-        else:
-            if current['content'].strip():
-                combined.append(current)
-            current = {
-                'timestamp': entry['timestamp'],
-                'speaker': speaker,
-                'content': entry['content'],
-                'word_count': len(entry['content'].split())
-            }
-
-    if current and current['content'].strip():
-        combined.append(current)
-
-    return combined
-
-def ensure_unique_timestamps(entries):
-    """Ensure all timestamps are unique and sequential."""
-    seen_timestamps = set()
-    result = []
-
-    for entry in entries:
-        timestamp = entry['timestamp']
-
-        while timestamp in seen_timestamps:
-            parts = timestamp.split(':')
-            hours = int(parts[0])
-            minutes = int(parts[1])
-            seconds_parts = parts[2].split('.')
-            seconds = int(seconds_parts[0])
-            milliseconds = int(seconds_parts[1])
-
-            milliseconds += 100
-            if milliseconds >= 1000:
-                milliseconds -= 1000
-                seconds += 1
-            if seconds >= 60:
-                seconds -= 60
-                minutes += 1
-            if minutes >= 60:
-                minutes -= 60
-                hours += 1
-
-            timestamp = f"{hours:02d}:{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
-
-        seen_timestamps.add(timestamp)
-        result.append({
-            'timestamp': timestamp,
-            'speaker': entry['speaker'],
-            'content': naturalize_content(entry['content'])
-        })
-
-    return result
-
-def create_nvivo_document(entries, output_path):
-    """Create the NVivo-compatible Word document."""
-    doc = Document()
-    table = doc.add_table(rows=1, cols=3)
-    table.style = 'Table Grid'
-
-    header_cells = table.rows[0].cells
-    header_cells[0].text = 'Timestamp'
-    header_cells[1].text = 'Speaker'
-    header_cells[2].text = 'Content'
-
-    for cell in header_cells:
-        for paragraph in cell.paragraphs:
-            for run in paragraph.runs:
-                run.bold = True
-
-    for entry in entries:
-        row = table.add_row()
-        row.cells[0].text = entry['timestamp']
-        row.cells[1].text = entry['speaker']
-        row.cells[2].text = entry['content']
-
-    for row in table.rows:
-        row.cells[0].width = Inches(1.5)
-        row.cells[1].width = Inches(1.5)
-        row.cells[2].width = Inches(4.5)
-
-    doc.save(output_path)
-```
-
-### Cleanup Instructions
-
-After creating the Word document:
-- Delete any temporary Python scripts created during processing
-- Use `rm` command (works on all platforms in Claude Code's bash environment)
-- Do NOT use Windows-specific commands like `del`
+### v1
+- Claude converted a Zoom `.vtt` directly to an NVivo `.docx`, writing the timestamps itself, from the reference script in this file.
